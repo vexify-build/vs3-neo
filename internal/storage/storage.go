@@ -71,7 +71,9 @@ type Storage interface {
 
 	// ---- Object operations ----
 	PutObject(ctx context.Context, bucket, key string, r io.Reader, size int64, opts model.PutOptions) (model.ObjectInfo, error)
-	GetObject(ctx context.Context, bucket, key, versionID string) (GetObjectResult, error)
+	// GetObject returns the object body. When off >= 0 a byte range of
+	// `length` bytes starting at `off` is returned (length -1 = to end).
+	GetObject(ctx context.Context, bucket, key, versionID string, off, length int64) (GetObjectResult, error)
 	HeadObject(ctx context.Context, bucket, key, versionID string) (model.ObjectInfo, error)
 	DeleteObject(ctx context.Context, bucket, key, versionID string) (model.ObjectInfo, error)
 	CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, opts model.PutOptions) (model.CopyObjectResult, error)
