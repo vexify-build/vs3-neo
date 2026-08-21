@@ -1,0 +1,26 @@
+{
+  "name": "vs3-neo",
+  "version": "0.1.0",
+  "description": "vs3-neo: an S3-compatible object storage server with pluggable storage backends, versioning and user-defined functions",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "vs3-neo": "bin/vs3-neo.js"
+  },
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/vs3-neo.js",
+    "dev": "node --watch bin/vs3-neo.js",
+    "test": "node --test \"test/**/*.test.mjs\""
+  },
+  "keywords": [
+    "s3",
+    "object-storage",
+    "storage",
+    "sigv4",
+    "minio"
+  ]
+}

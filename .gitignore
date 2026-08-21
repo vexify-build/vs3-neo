@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# disk storage data
+data/
+
+# logs
+*.log
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/
