@@ -109,6 +109,91 @@ export class S3Client {
   async getVersioning(bucket) {
     return this.request('GET', `/${bucket}`, { query: { versioning: '' } });
   }
+
+  // ---- tagging ----
+  async getObjectTagging(bucket, key, query = {}) {
+    return this.request('GET', `/${bucket}/${key}`, { query: { tagging: '', ...query } });
+  }
+  async putObjectTagging(bucket, key, tags, query = {}) {
+    return this.request('PUT', `/${bucket}/${key}`, {
+      query: { tagging: '', ...query },
+      headers: { 'Content-Type': 'application/xml' },
+      body: tagsToXml(tags),
+    });
+  }
+  async deleteObjectTagging(bucket, key, query = {}) {
+    return this.request('DELETE', `/${bucket}/${key}`, { query: { tagging: '', ...query } });
+  }
+  async getBucketTagging(bucket) {
+    return this.request('GET', `/${bucket}`, { query: { tagging: '' } });
+  }
+  async putBucketTagging(bucket, tags) {
+    return this.request('PUT', `/${bucket}`, {
+      query: { tagging: '' },
+      headers: { 'Content-Type': 'application/xml' },
+      body: tagsToXml(tags),
+    });
+  }
+  async deleteBucketTagging(bucket) {
+    return this.request('DELETE', `/${bucket}`, { query: { tagging: '' } });
+  }
+
+  // ---- policy ----
+  async getBucketPolicy(bucket) {
+    return this.request('GET', `/${bucket}`, { query: { policy: '' } });
+  }
+  async putBucketPolicy(bucket, policy) {
+    return this.request('PUT', `/${bucket}`, {
+      query: { policy: '' },
+      headers: { 'Content-Type': 'application/json' },
+      body: typeof policy === 'string' ? policy : JSON.stringify(policy),
+    });
+  }
+  async deleteBucketPolicy(bucket) {
+    return this.request('DELETE', `/${bucket}`, { query: { policy: '' } });
+  }
+
+  // ---- lifecycle ----
+  async getBucketLifecycle(bucket) {
+    return this.request('GET', `/${bucket}`, { query: { lifecycle: '' } });
+  }
+  async putBucketLifecycle(bucket, rules) {
+    return this.request('PUT', `/${bucket}`, {
+      query: { lifecycle: '' },
+      headers: { 'Content-Type': 'application/xml' },
+      body: rulesToXml(rules),
+    });
+  }
+  async deleteBucketLifecycle(bucket) {
+    return this.request('DELETE', `/${bucket}`, { query: { lifecycle: '' } });
+  }
+}
+
+function tagsToXml(tags) {
+  const inner = (tags || [])
+    .map((t) => `<Tag><Key>${t.Key}</Key><Value>${t.Value}</Value></Tag>`)
+    .join('');
+  return `<?xml version="1.0" encoding="UTF-8"?><Tagging xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><TagSet>${inner}</TagSet></Tagging>`;
+}
+
+function rulesToXml(rules) {
+  const inner = (rules || [])
+    .map((r) => {
+      const id = r.id ? `<ID>${r.id}</ID>` : '';
+      const filter = r.prefix ? `<Filter><Prefix>${r.prefix}</Prefix></Filter>` : '';
+      const status = `<Status>${r.status || 'Enabled'}</Status>`;
+      const exp =
+        r.expiration && r.expiration.days !== undefined
+          ? `<Expiration><Days>${r.expiration.days}</Days></Expiration>`
+          : '';
+      const abort =
+        r.abort && r.abort.days !== undefined
+          ? `<AbortIncompleteMultipartUpload><DaysAfterInitiation>${r.abort.days}</DaysAfterInitiation></AbortIncompleteMultipartUpload>`
+          : '';
+      return `<Rule>${id}${filter}${status}${exp}${abort}</Rule>`;
+    })
+    .join('');
+  return `<?xml version="1.0" encoding="UTF-8"?><LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">${inner}</LifecycleConfiguration>`;
 }
 
 function cryptoHash(buf) {

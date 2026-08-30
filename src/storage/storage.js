@@ -116,6 +116,48 @@ export class Storage {
   async listMultipartUploads(bucket) {
     throw notImplemented('listMultipartUploads');
   }
+  // ---- tagging ----
+  async getObjectTagging(bucket, key, versionId) {
+    throw notImplemented('getObjectTagging');
+  }
+  async setObjectTagging(bucket, key, tags, versionId) {
+    throw notImplemented('setObjectTagging');
+  }
+  async deleteObjectTagging(bucket, key, versionId) {
+    throw notImplemented('deleteObjectTagging');
+  }
+  async getBucketTagging(bucket) {
+    throw notImplemented('getBucketTagging');
+  }
+  async setBucketTagging(bucket, tags) {
+    throw notImplemented('setBucketTagging');
+  }
+  async deleteBucketTagging(bucket) {
+    throw notImplemented('deleteBucketTagging');
+  }
+  // ---- policy ----
+  async getBucketPolicy(bucket) {
+    throw notImplemented('getBucketPolicy');
+  }
+  async setBucketPolicy(bucket, policy) {
+    throw notImplemented('setBucketPolicy');
+  }
+  async deleteBucketPolicy(bucket) {
+    throw notImplemented('deleteBucketPolicy');
+  }
+  // ---- lifecycle ----
+  async getLifecycle(bucket) {
+    throw notImplemented('getLifecycle');
+  }
+  async setLifecycle(bucket, rules) {
+    throw notImplemented('setLifecycle');
+  }
+  async deleteLifecycle(bucket) {
+    throw notImplemented('deleteLifecycle');
+  }
+  async runLifecycle(bucket) {
+    return 0;
+  }
 }
 
 function notImplemented(method) {

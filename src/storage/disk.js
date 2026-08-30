@@ -16,6 +16,7 @@ import fs from 'node:fs/promises';
 import fss from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { Readable } from 'node:stream';
 
 import {
   Storage,
@@ -32,6 +33,7 @@ import {
   errInvalidPartOrder,
   errInvalidArgument,
 } from './storage.js';
+import { encryptFile, decryptFileToBuffer, ensureMasterKey, SSE_ALGORITHM } from '../util/sse.js';
 
 // The default on-disk backend. Layout under dataDir:
 //   {bucket}/bucket.json              bucket metadata
@@ -47,10 +49,16 @@ export class DiskStorage extends Storage {
   constructor(dataDir) {
     super();
     this.dataDir = dataDir;
+    this.masterKey = null;
   }
 
   async init() {
     await fs.mkdir(this.dataDir, { recursive: true });
+    this.masterKey = await ensureMasterKey(this.keyPath());
+  }
+
+  keyPath() {
+    return path.join(this.dataDir, 'sse-master.key');
   }
 
   // ---- paths ----
@@ -175,6 +183,7 @@ export class DiskStorage extends Storage {
       const versioning = meta.versioning;
       const versionId = versioning === 'Enabled' ? randomHex(16) : 'null';
       const dataPath = this.dataFilePath(bucket, key, versionId);
+      const encrypt = opts.sse === SSE_ALGORITHM;
 
       // Stream to a temp file first (atomic swap later), computing md5.
       await fs.mkdir(path.dirname(dataPath), { recursive: true });
@@ -188,7 +197,14 @@ export class DiskStorage extends Storage {
       if (versioning !== 'Enabled') {
         for (const v of om.versions) await this._removeDataFile(bucket, key, v);
       }
-      await fs.rename(tmp, dataPath);
+      let enc;
+      if (encrypt) {
+        const info = await encryptFile(tmp, dataPath, this.masterKey);
+        await fs.rm(tmp, { force: true });
+        enc = { algorithm: SSE_ALGORITHM, nonce: info.nonce, tag: info.tag };
+      } else {
+        await fs.rename(tmp, dataPath);
+      }
 
       const entry = {
         versionId,
@@ -199,6 +215,7 @@ export class DiskStorage extends Storage {
         lastModified: new Date().toISOString(),
         isDeleteMarker: false,
       };
+      if (enc) entry.enc = enc;
       if (versioning === 'Enabled') {
         om.versions = [entry, ...om.versions];
         if (om.versions.length > 100) {
@@ -217,6 +234,21 @@ export class DiskStorage extends Storage {
   async getObject(bucket, key, versionId, range) {
     const obj = await this.headObject(bucket, key, versionId);
     const dataPath = this.dataFilePath(bucket, key, obj.versionId);
+
+    // Encrypted objects are decrypted whole (AES-GCM) then sliced for ranges.
+    if (obj.enc) {
+      const plain = await decryptFileToBuffer(dataPath, this.masterKey, obj.enc.nonce, obj.enc.tag);
+      let start = 0;
+      let end = plain.length - 1;
+      if (range) {
+        start = range.start;
+        end = range.end === undefined ? plain.length - 1 : Math.min(range.end, plain.length - 1);
+        if (start > end || start >= plain.length) throw new S3ErrRange(plain.length);
+      }
+      const data = plain.subarray(start, end + 1);
+      return { object: { ...obj, size: data.length }, stream: Readable.from([data]) };
+    }
+
     const stat = await fs.stat(dataPath).catch(() => null);
     if (!stat) throw errNoSuchKey();
     let start = 0;
@@ -427,6 +459,7 @@ export class DiskStorage extends Storage {
       initiated: new Date().toISOString(),
       parts: [],
     };
+    if (opts.sse === SSE_ALGORITHM) um.sse = SSE_ALGORITHM;
     await writeJsonAtomic(this.uploadMetaPath(bucket, uploadId), um);
     return uploadId;
   }
@@ -485,7 +518,14 @@ export class DiskStorage extends Storage {
       if (versioning !== 'Enabled') {
         for (const v of om.versions) await this._removeDataFile(bucket, key, v);
       }
-      await fs.rename(tmp, dataPath);
+      let enc;
+      if (um.sse === SSE_ALGORITHM) {
+        const info = await encryptFile(tmp, dataPath, this.masterKey);
+        await fs.rm(tmp, { force: true });
+        enc = { algorithm: SSE_ALGORITHM, nonce: info.nonce, tag: info.tag };
+      } else {
+        await fs.rename(tmp, dataPath);
+      }
 
       const entry = {
         versionId,
@@ -496,6 +536,7 @@ export class DiskStorage extends Storage {
         lastModified: new Date().toISOString(),
         isDeleteMarker: false,
       };
+      if (enc) entry.enc = enc;
       if (versioning === 'Enabled') {
         om.versions = [entry, ...om.versions].slice(0, 100);
         if (om.versions.length > 100) {
@@ -546,6 +587,129 @@ export class DiskStorage extends Storage {
       }
     }
     return out;
+  }
+
+  // ---- tagging ----
+  async getObjectTagging(bucket, key, versionId) {
+    const om = await this._readObjectMeta(bucket, key);
+    const v = this._findVersion(om, versionId);
+    if (!v || v.isDeleteMarker) throw errNoSuchKey();
+    return v.tags || [];
+  }
+
+  async setObjectTagging(bucket, key, tags, versionId) {
+    await withKeyLock(`${bucket}/${key}`, async () => {
+      const om = await this._readObjectMeta(bucket, key);
+      const v = versionId ? om.versions.find((x) => x.versionId === versionId) : om.versions[0];
+      if (!v || v.isDeleteMarker) throw errNoSuchKey();
+      v.tags = Array.isArray(tags) ? tags : [];
+      await writeJsonAtomic(this.objectMetaPath(bucket, key), om);
+    });
+  }
+
+  async deleteObjectTagging(bucket, key, versionId) {
+    await this.setObjectTagging(bucket, key, [], versionId);
+  }
+
+  async getBucketTagging(bucket) {
+    const meta = await this._bucketMeta(bucket);
+    return meta.tags || [];
+  }
+
+  async setBucketTagging(bucket, tags) {
+    const meta = await this._bucketMeta(bucket);
+    meta.tags = Array.isArray(tags) ? tags : [];
+    await writeJsonAtomic(this.bucketMetaPath(bucket), meta);
+  }
+
+  async deleteBucketTagging(bucket) {
+    const meta = await this._bucketMeta(bucket);
+    delete meta.tags;
+    await writeJsonAtomic(this.bucketMetaPath(bucket), meta);
+  }
+
+  // ---- policy ----
+  async getBucketPolicy(bucket) {
+    const meta = await this._bucketMeta(bucket);
+    return meta.policy || null;
+  }
+
+  async setBucketPolicy(bucket, policy) {
+    const meta = await this._bucketMeta(bucket);
+    meta.policy = String(policy);
+    await writeJsonAtomic(this.bucketMetaPath(bucket), meta);
+  }
+
+  async deleteBucketPolicy(bucket) {
+    const meta = await this._bucketMeta(bucket);
+    delete meta.policy;
+    await writeJsonAtomic(this.bucketMetaPath(bucket), meta);
+  }
+
+  // ---- lifecycle ----
+  async getLifecycle(bucket) {
+    const meta = await this._bucketMeta(bucket);
+    return meta.lifecycle || [];
+  }
+
+  async setLifecycle(bucket, rules) {
+    const meta = await this._bucketMeta(bucket);
+    meta.lifecycle = Array.isArray(rules) ? rules : [];
+    await writeJsonAtomic(this.bucketMetaPath(bucket), meta);
+  }
+
+  async deleteLifecycle(bucket) {
+    const meta = await this._bucketMeta(bucket);
+    delete meta.lifecycle;
+    await writeJsonAtomic(this.bucketMetaPath(bucket), meta);
+  }
+
+  // Apply the bucket lifecycle: expire objects older than Expiration.Days and
+  // abort incomplete multipart uploads older than AbortIncompleteMultipartUpload.
+  // Returns the number of entities removed.
+  async runLifecycle(bucket) {
+    let meta;
+    try {
+      meta = await this._bucketMeta(bucket);
+    } catch {
+      return 0;
+    }
+    const rules = (meta.lifecycle || []).filter((r) => r && (r.status || 'Enabled') === 'Enabled');
+    if (rules.length === 0) return 0;
+    const now = Date.now();
+    const versioning = meta.versioning;
+    let removed = 0;
+
+    const keys = await this._collectKeys(bucket);
+    for (const key of keys) {
+      const om = await this._readObjectMeta(bucket, key);
+      const v = om.versions[0];
+      if (!v || v.isDeleteMarker) continue;
+      const ageDays = (now - new Date(v.lastModified).getTime()) / 86400000;
+      for (const rule of rules) {
+        if (!lifecycleMatches(rule, key)) continue;
+        if (rule.expiration && rule.expiration.days !== undefined && ageDays >= rule.expiration.days) {
+          if (versioning === 'Enabled') await this.deleteObject(bucket, key, v.versionId);
+          else await this.deleteObject(bucket, key, '');
+          removed++;
+          break;
+        }
+      }
+    }
+
+    for (const rule of rules) {
+      if (!rule.abort || rule.abort.days === undefined) continue;
+      const cutoff = now - rule.abort.days * 86400000;
+      const uploads = await this.listMultipartUploads(bucket);
+      for (const u of uploads) {
+        if (!lifecycleMatches(rule, u.key)) continue;
+        if (new Date(u.initiated).getTime() < cutoff) {
+          await this.abortMultipartUpload(bucket, u.key, u.uploadId);
+          removed++;
+        }
+      }
+    }
+    return removed;
   }
 
   // ---- internal helpers ----
@@ -607,11 +771,19 @@ function toObjectInfo(bucket, key, v) {
     lastModified: new Date(v.lastModified),
     isDeleteMarker: !!v.isDeleteMarker,
     storageClass: 'STANDARD',
+    sse: v.enc && v.enc.algorithm === SSE_ALGORITHM ? SSE_ALGORITHM : undefined,
+    enc: v.enc || undefined,
   };
 }
 
 function hashKey(key) {
   return crypto.createHash('md5').update(key).digest('hex');
+}
+
+// True if the lifecycle rule's prefix (when set) matches the key.
+function lifecycleMatches(rule, key) {
+  if (!rule.prefix) return true;
+  return key.startsWith(rule.prefix);
 }
 
 async function fileExists(p) {

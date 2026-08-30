@@ -17,6 +17,7 @@ import crypto from 'node:crypto';
 
 import { loadConfig } from './config.js';
 import { verifyRequest, Presigner } from './auth/sigv4.js';
+import { evaluatePolicy } from './auth/policy.js';
 import { createBackend } from './storage/storage.js';
 import './storage/disk.js';
 import './storage/memory.js';
@@ -27,8 +28,43 @@ import './plugin/builtin.js';
 import { S3Error, toS3Error, errorXml } from './api/errors.js';
 import * as xml from './api/xml_responses.js';
 import { httpDate } from './util/xml.js';
+import { SSE_HEADER, SSE_ALGORITHM } from './util/sse.js';
 
 const VERSION = '0.1.0';
+
+// Map an S3 operation name to the IAM action used for bucket-policy checks.
+const OP_ACTIONS = {
+  CreateBucket: 's3:CreateBucket',
+  DeleteBucket: 's3:DeleteBucket',
+  HeadBucket: 's3:ListBucket',
+  GetBucketLocation: 's3:GetBucketLocation',
+  GetBucketVersioning: 's3:GetBucketVersioning',
+  SetBucketVersioning: 's3:PutBucketVersioning',
+  GetBucketTagging: 's3:GetBucketTagging',
+  PutBucketTagging: 's3:PutBucketTagging',
+  DeleteBucketTagging: 's3:DeleteBucketTagging',
+  GetBucketPolicy: 's3:GetBucketPolicy',
+  PutBucketPolicy: 's3:PutBucketPolicy',
+  DeleteBucketPolicy: 's3:DeleteBucketPolicy',
+  GetBucketLifecycle: 's3:GetLifecycleConfiguration',
+  PutBucketLifecycle: 's3:PutLifecycleConfiguration',
+  DeleteBucketLifecycle: 's3:PutLifecycleConfiguration',
+  ListObjects: 's3:ListBucket',
+  ListObjectsV2: 's3:ListBucket',
+  ListObjectVersions: 's3:ListBucketVersions',
+  PutObject: 's3:PutObject',
+  GetObject: 's3:GetObject',
+  HeadObject: 's3:GetObject',
+  DeleteObject: 's3:DeleteObject',
+  DeleteObjects: 's3:DeleteObject',
+  CopyObject: 's3:PutObject',
+  CreateMultipartUpload: 's3:PutObject',
+  UploadPart: 's3:PutObject',
+  CompleteMultipartUpload: 's3:PutObject',
+  AbortMultipartUpload: 's3:AbortMultipartUpload',
+  ListParts: 's3:ListMultipartUploadParts',
+  ListMultipartUploads: 's3:ListBucketMultipartUploads',
+};
 
 // Map an S3 operation name to its hook point.
 const HOOK_BY_OP = {
@@ -52,6 +88,7 @@ export class S3Server {
     this.storage = createBackend(config.storage.backend, {
       ...(config.storage[config.storage.backend] || {}),
       dataDir: config.storage.disk && config.storage.disk.dataDir,
+      sseKey: config.encryption && config.encryption.key,
     });
     this.region = config.server.region || 'us-east-1';
     this.startTime = Date.now();
@@ -138,7 +175,9 @@ export class S3Server {
         return;
       }
       const op = this._dispatch(n);
-      this._authorize(n);
+      const identity = this._authorize(n);
+      n._identity = identity;
+      await this._enforcePolicy(n, op);
       this._recordOp(op);
 
       const ctx = new FunctionContext({
@@ -171,7 +210,27 @@ export class S3Server {
   }
 
   _authorize(n) {
-    verifyRequest(n, this._provider(), { anonymous: !!this.config.auth.anonymous });
+    return verifyRequest(n, this._provider(), { anonymous: !!this.config.auth.anonymous });
+  }
+
+  // Evaluate the bucket policy (if any) against this request. An explicit
+  // Deny, or an anonymous principal not granted by the policy, is rejected.
+  async _enforcePolicy(n, op) {
+    const bucket = n.segments[0] || '';
+    const action = OP_ACTIONS[op];
+    if (!bucket || !action) return;
+    const policy = await this.storage.getBucketPolicy(bucket).catch(() => null);
+    if (!policy) return;
+    const key = n.segments.slice(1).join('/');
+    const resource = key ? `arn:aws:s3:::${bucket}/${key}` : `arn:aws:s3:::${bucket}`;
+    const decision = evaluatePolicy(policy, {
+      principal: (n._identity && n._identity.accessKey) || null,
+      action,
+      resource,
+    });
+    if (decision === 'deny') {
+      throw new S3Error('AccessDenied', 'Access Denied by bucket policy', 403);
+    }
   }
 
   _recordOp(op) {
@@ -194,16 +253,25 @@ export class S3Server {
         case 'GET':
           if ('location' in q) return 'GetBucketLocation';
           if ('versioning' in q) return 'GetBucketVersioning';
+          if ('tagging' in q) return 'GetBucketTagging';
+          if ('policy' in q) return 'GetBucketPolicy';
+          if ('lifecycle' in q) return 'GetBucketLifecycle';
           if ('uploads' in q) return 'ListMultipartUploads';
           if ('versions' in q) return 'ListObjectVersions';
           if (q['list-type'] === '2') return 'ListObjectsV2';
           return 'ListObjects';
         case 'PUT':
           if ('versioning' in q) return 'SetBucketVersioning';
+          if ('tagging' in q) return 'PutBucketTagging';
+          if ('policy' in q) return 'PutBucketPolicy';
+          if ('lifecycle' in q) return 'PutBucketLifecycle';
           return 'CreateBucket';
         case 'HEAD':
           return 'HeadBucket';
         case 'DELETE':
+          if ('tagging' in q) return 'DeleteBucketTagging';
+          if ('policy' in q) return 'DeleteBucketPolicy';
+          if ('lifecycle' in q) return 'DeleteBucketLifecycle';
           return 'DeleteBucket';
         case 'POST':
           if ('delete' in q) return 'DeleteObjects';
@@ -217,15 +285,18 @@ export class S3Server {
     switch (method) {
       case 'GET':
         if ('uploadId' in q) return 'ListParts';
+        if ('tagging' in q) return 'GetObjectTagging';
         return 'GetObject';
       case 'PUT':
         if ('uploadId' in q && 'partNumber' in q) return 'UploadPart';
+        if ('tagging' in q) return 'PutObjectTagging';
         if (n.headers['x-amz-copy-source']) return 'CopyObject';
         return 'PutObject';
       case 'HEAD':
         return 'HeadObject';
       case 'DELETE':
         if ('uploadId' in q) return 'AbortMultipartUpload';
+        if ('tagging' in q) return 'DeleteObjectTagging';
         return 'DeleteObject';
       case 'POST':
         if ('uploads' in q) return 'CreateMultipartUpload';
@@ -289,6 +360,30 @@ export class S3Server {
         return this._listParts(res, bucket, key, q);
       case 'ListMultipartUploads':
         return this._listMultipartUploads(res, bucket);
+      case 'GetObjectTagging':
+        return this._getObjectTagging(res, bucket, key, q);
+      case 'PutObjectTagging':
+        return this._putObjectTagging(res, req, bucket, key, q);
+      case 'DeleteObjectTagging':
+        return this._deleteObjectTagging(res, bucket, key, q);
+      case 'GetBucketTagging':
+        return this._getBucketTagging(res, bucket);
+      case 'PutBucketTagging':
+        return this._putBucketTagging(res, req, bucket);
+      case 'DeleteBucketTagging':
+        return this._deleteBucketTagging(res, bucket);
+      case 'GetBucketPolicy':
+        return this._getBucketPolicy(res, bucket);
+      case 'PutBucketPolicy':
+        return this._putBucketPolicy(res, req, bucket);
+      case 'DeleteBucketPolicy':
+        return this._deleteBucketPolicy(res, bucket);
+      case 'GetBucketLifecycle':
+        return this._getBucketLifecycle(res, bucket);
+      case 'PutBucketLifecycle':
+        return this._putBucketLifecycle(res, req, bucket);
+      case 'DeleteBucketLifecycle':
+        return this._deleteBucketLifecycle(res, bucket);
       case 'NotImplemented':
         throw new S3Error('NotImplemented', 'A header you provided implies functionality that is not implemented.', 501);
       default:
@@ -412,7 +507,8 @@ export class S3Server {
     const userMeta = extractUserMeta(req.headers);
     const md5Header = req.headers['content-md5'];
     const size = parseInt(req.headers['content-length'] || '0', 10);
-    const info = await this.storage.putObject(bucket, key, req, size, { contentType, userMeta });
+    const sse = parseSseHeader(req.headers[SSE_HEADER]);
+    const info = await this.storage.putObject(bucket, key, req, size, { contentType, userMeta, sse });
     this.metrics.bytesIn += size;
     if (md5Header) {
       const expected = Buffer.from(md5Header, 'base64').toString('hex');
@@ -421,6 +517,7 @@ export class S3Server {
       }
     }
     res.setHeader('ETag', quoteEtag(info.etag));
+    if (info.sse) res.setHeader(SSE_HEADER, info.sse);
     if (info.versionId && info.versionId !== 'null') {
       res.setHeader('x-amz-version-id', info.versionId);
     }
@@ -477,6 +574,7 @@ export class S3Server {
     res.setHeader('ETag', quoteEtag(o.etag));
     res.setHeader('Last-Modified', httpDate(o.lastModified));
     res.setHeader('Accept-Ranges', 'bytes');
+    if (o.sse) res.setHeader(SSE_HEADER, o.sse);
     if (o.versionId && o.versionId !== 'null') {
       res.setHeader('x-amz-version-id', o.versionId);
     }
@@ -529,19 +627,115 @@ export class S3Server {
     if (slash < 0) throw new S3Error('InvalidArgument', 'Invalid copy source', 400);
     const srcBucket = srcPath.slice(0, slash);
     const srcKey = srcPath.slice(slash + 1);
+    // Propagate encryption: honor an explicit destination header, otherwise
+    // keep the source object's encryption.
+    let sse = parseSseHeader(req.headers[SSE_HEADER]);
+    if (!sse) {
+      const srcHead = await this.storage.headObject(srcBucket, srcKey, srcVersion).catch(() => null);
+      if (srcHead && srcHead.sse) sse = srcHead.sse;
+    }
     const opts = {
       contentType: req.headers['content-type'] || '',
       userMeta: extractUserMeta(req.headers),
+      sse,
     };
     const result = await this.storage.copyObject(srcBucket, srcKey, bucket, key, opts);
     this._sendXml(res, 200, xml.copyObjectXml(result.etag, result.lastModified));
+  }
+
+  // ---- Tagging ----
+  async _getObjectTagging(res, bucket, key, q) {
+    const versionId = q['versionId'] || q['version-id'] || '';
+    const tags = await this.storage.getObjectTagging(bucket, key, versionId);
+    this._sendXml(res, 200, xml.taggingXml(tags));
+  }
+
+  async _putObjectTagging(res, req, bucket, key, q) {
+    const versionId = q['versionId'] || q['version-id'] || '';
+    const body = await readBody(req);
+    const tags = extractTags(body);
+    await this.storage.setObjectTagging(bucket, key, tags, versionId);
+    this._sendResponse(res, 200, {}, '');
+  }
+
+  async _deleteObjectTagging(res, bucket, key, q) {
+    const versionId = q['versionId'] || q['version-id'] || '';
+    await this.storage.deleteObjectTagging(bucket, key, versionId);
+    this._sendResponse(res, 204, {}, '');
+  }
+
+  async _getBucketTagging(res, bucket) {
+    const tags = await this.storage.getBucketTagging(bucket);
+    if (!tags || tags.length === 0) {
+      throw new S3Error('NoSuchTagSet', 'The TagSet does not exist', 404);
+    }
+    this._sendXml(res, 200, xml.taggingXml(tags));
+  }
+
+  async _putBucketTagging(res, req, bucket) {
+    const body = await readBody(req);
+    const tags = extractTags(body);
+    await this.storage.setBucketTagging(bucket, tags);
+    this._sendResponse(res, 200, {}, '');
+  }
+
+  async _deleteBucketTagging(res, bucket) {
+    await this.storage.deleteBucketTagging(bucket);
+    this._sendResponse(res, 204, {}, '');
+  }
+
+  // ---- Policy ----
+  async _getBucketPolicy(res, bucket) {
+    const policy = await this.storage.getBucketPolicy(bucket);
+    if (!policy) {
+      throw new S3Error('NoSuchBucketPolicy', 'The bucket policy does not exist', 404);
+    }
+    this._sendResponse(res, 200, { 'Content-Type': 'application/json' }, policy);
+  }
+
+  async _putBucketPolicy(res, req, bucket) {
+    const body = await readBody(req);
+    try {
+      JSON.parse(body);
+    } catch {
+      throw new S3Error('MalformedPolicy', 'Policy has invalid JSON', 400);
+    }
+    await this.storage.setBucketPolicy(bucket, body);
+    this._sendResponse(res, 204, {}, '');
+  }
+
+  async _deleteBucketPolicy(res, bucket) {
+    await this.storage.deleteBucketPolicy(bucket);
+    this._sendResponse(res, 204, {}, '');
+  }
+
+  // ---- Lifecycle ----
+  async _getBucketLifecycle(res, bucket) {
+    const rules = await this.storage.getLifecycle(bucket);
+    if (!rules || rules.length === 0) {
+      throw new S3Error('NoSuchLifecycleConfiguration', 'The lifecycle configuration does not exist', 404);
+    }
+    this._sendXml(res, 200, xml.lifecycleXml(rules));
+  }
+
+  async _putBucketLifecycle(res, req, bucket) {
+    const body = await readBody(req);
+    const rules = extractLifecycleRules(body);
+    await this.storage.setLifecycle(bucket, rules);
+    this._sendResponse(res, 200, {}, '');
+  }
+
+  async _deleteBucketLifecycle(res, bucket) {
+    await this.storage.deleteLifecycle(bucket);
+    this._sendResponse(res, 204, {}, '');
   }
 
   // ---- Multipart ----
   async _createMultipartUpload(res, req, bucket, key) {
     const contentType = req.headers['content-type'] || 'application/octet-stream';
     const userMeta = extractUserMeta(req.headers);
-    const uploadId = await this.storage.createMultipartUpload(bucket, key, { contentType, userMeta });
+    const sse = parseSseHeader(req.headers[SSE_HEADER]);
+    const uploadId = await this.storage.createMultipartUpload(bucket, key, { contentType, userMeta, sse });
     this._sendXml(res, 200, xml.initMultipartXml(bucket, key, uploadId));
   }
 
@@ -685,6 +879,20 @@ export class S3Server {
       case 'functions':
         this._sendJson(res, 200, { functions: listFunctions() });
         return;
+      case 'lifecycle': {
+        // Trigger lifecycle processing. Authenticated; optional ?bucket= filter.
+        verifyRequest(n, this._provider(), { anonymous: !!this.config.auth.anonymous });
+        const target = n.queryParams['bucket'] || '';
+        const buckets = target
+          ? [target]
+          : (await this.storage.listBuckets()).map((b) => b.name);
+        let removed = 0;
+        for (const b of buckets) {
+          removed += await this.storage.runLifecycle(b).catch(() => 0);
+        }
+        this._sendJson(res, 200, { buckets: buckets.length, removed });
+        return;
+      }
       default:
         throw new S3Error('NoSuchKey', `Unknown internal endpoint /__${sub}`, 404);
     }
@@ -789,4 +997,49 @@ function extractCompleteParts(xml) {
     if (Number.isFinite(partNumber)) parts.push({ partNumber, etag });
   }
   return parts;
+}
+
+// Validate/normalize the SSE request header: only "AES256" is supported.
+function parseSseHeader(header) {
+  if (!header) return '';
+  return String(header).trim() === SSE_ALGORITHM ? SSE_ALGORITHM : '';
+}
+
+// Parse <Tagging><TagSet><Tag><Key>..</Key><Value>..</Value></Tag>...</TagSet></Tagging>.
+function extractTags(xmlStr) {
+  const tags = [];
+  const re = /<Tag>([\s\S]*?)<\/Tag>/g;
+  let m;
+  while ((m = re.exec(xmlStr || '')) !== null) {
+    const block = m[1];
+    tags.push({ Key: extractXmlTag(block, 'Key'), Value: extractXmlTag(block, 'Value') });
+  }
+  return tags;
+}
+
+// Parse <LifecycleConfiguration><Rule>...</Rule>...</LifecycleConfiguration>.
+function extractLifecycleRules(xmlStr) {
+  const rules = [];
+  const re = /<Rule>([\s\S]*?)<\/Rule>/g;
+  let m;
+  while ((m = re.exec(xmlStr || '')) !== null) {
+    const block = m[1];
+    const rule = {
+      id: extractXmlTag(block, 'ID') || undefined,
+      prefix: extractXmlTag(block, 'Prefix') || undefined,
+      status: extractXmlTag(block, 'Status') || 'Enabled',
+    };
+    const expDays = extractNestedXmlTag(block, 'Expiration', 'Days');
+    if (expDays) rule.expiration = { days: parseInt(expDays, 10) };
+    const abortDays = extractNestedXmlTag(block, 'AbortIncompleteMultipartUpload', 'DaysAfterInitiation');
+    if (abortDays) rule.abort = { days: parseInt(abortDays, 10) };
+    rules.push(rule);
+  }
+  return rules;
+}
+
+function extractNestedXmlTag(xmlStr, outer, inner) {
+  const re = new RegExp(`<${outer}>[\\s\\S]*?<${inner}>([^<]*)</${inner}>[\\s\\S]*?</${outer}>`);
+  const m = re.exec(xmlStr || '');
+  return m ? m[1] : '';
 }
