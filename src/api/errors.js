@@ -49,6 +49,7 @@ export const ERROR_STATUS = {
   InvalidURI: 400,
   KeyTooLongError: 400,
   MalformedACLError: 400,
+  MalformedPolicy: 400,
   MalformedPOSTRequest: 400,
   MalformedXML: 400,
   MaxMessageLengthExceeded: 400,

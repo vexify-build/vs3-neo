@@ -28,13 +28,14 @@ config.functions.enabled = true;
 config.functions.hooks = { onPut: 'log', onGet: '', onDelete: '' };
 
 let server;
+let s3server;
 let addr;
 let client;
 
 before(async () => {
-  const s3 = new S3Server(config);
-  await s3.init();
-  server = s3.listen(0, '127.0.0.1');
+  s3server = new S3Server(config);
+  await s3server.init();
+  server = s3server.listen(0, '127.0.0.1');
   await new Promise((resolve) => server.once('listening', resolve));
   addr = server.address();
   client = new S3Client({
@@ -273,4 +274,258 @@ test('health & info endpoints', async () => {
   assert.equal(data.storage, 'memory');
   const metrics = await fetch(`http://127.0.0.1:${addr.port}/__metrics`);
   assert.ok((await metrics.text()).includes('vs3_requests_total'));
+});
+
+// ---- object tagging ----
+test('tagging: object tag put / get / delete', async () => {
+  await client.createBucket('tag-obj');
+  await client.putObject('tag-obj', 'doc.txt', 'hello');
+
+  const put = await client.putObjectTagging('tag-obj', 'doc.txt', [
+    { Key: 'env', Value: 'prod' },
+    { Key: 'team', Value: 'storage' },
+  ]);
+  assert.ok(put.ok, put.text);
+
+  const get = await client.getObjectTagging('tag-obj', 'doc.txt');
+  assert.equal(get.status, 200);
+  assert.ok(get.text.includes('<Key>env</Key><Value>prod</Value>'));
+  assert.ok(get.text.includes('<Key>team</Key><Value>storage</Value>'));
+
+  const del = await client.deleteObjectTagging('tag-obj', 'doc.txt');
+  assert.equal(del.status, 204);
+
+  const empty = await client.getObjectTagging('tag-obj', 'doc.txt');
+  assert.equal(empty.status, 200);
+  assert.ok(empty.text.includes('<TagSet></TagSet>'));
+
+  const missing = await client.getObjectTagging('tag-obj', 'nope.txt');
+  assert.equal(missing.status, 404);
+});
+
+test('tagging: object tags are per-version', async () => {
+  await client.createBucket('tag-ver');
+  await client.setVersioning('tag-ver', 'Enabled');
+
+  const put1 = await client.putObject('tag-ver', 'f.txt', 'v1');
+  const v1 = put1.headers.get('x-amz-version-id');
+  await client.putObjectTagging('tag-ver', 'f.txt', [{ Key: 'stage', Value: 'one' }], { versionId: v1 });
+
+  const put2 = await client.putObject('tag-ver', 'f.txt', 'v2');
+  const v2 = put2.headers.get('x-amz-version-id');
+
+  // latest version has no tags
+  const latest = await client.getObjectTagging('tag-ver', 'f.txt');
+  assert.ok(latest.text.includes('<TagSet></TagSet>'));
+
+  // old version keeps its tags
+  const old = await client.getObjectTagging('tag-ver', 'f.txt', { versionId: v1 });
+  assert.ok(old.text.includes('<Key>stage</Key><Value>one</Value>'));
+  assert.notEqual(v1, v2);
+});
+
+// ---- bucket tagging ----
+test('tagging: bucket tag put / get / delete', async () => {
+  await client.createBucket('tag-bucket');
+
+  const put = await client.putBucketTagging('tag-bucket', [{ Key: 'owner', Value: 'platform' }]);
+  assert.ok(put.ok, put.text);
+
+  const get = await client.getBucketTagging('tag-bucket');
+  assert.equal(get.status, 200);
+  assert.ok(get.text.includes('<Key>owner</Key><Value>platform</Value>'));
+
+  const del = await client.deleteBucketTagging('tag-bucket');
+  assert.equal(del.status, 204);
+
+  const empty = await client.getBucketTagging('tag-bucket');
+  assert.equal(empty.status, 404);
+  assert.ok(empty.text.includes('NoSuchTagSet'));
+});
+
+// ---- server-side encryption (SSE-S3) ----
+test('sse: put / get / head roundtrip with AES256', async () => {
+  await client.createBucket('sse');
+  const content = 'classified payload';
+  const put = await client.putObject('sse', 'secret.txt', content, {
+    'x-amz-server-side-encryption': 'AES256',
+  });
+  assert.ok(put.ok, put.text);
+  assert.equal(put.headers.get('x-amz-server-side-encryption'), 'AES256');
+
+  const get = await client.getObject('sse', 'secret.txt');
+  assert.equal(get.status, 200);
+  assert.equal(get.text, content);
+  assert.equal(get.headers.get('x-amz-server-side-encryption'), 'AES256');
+
+  const head = await client.headObject('sse', 'secret.txt');
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get('x-amz-server-side-encryption'), 'AES256');
+
+  // data at rest must not be plaintext in the memory backend
+  const raw = s3server.storage.buckets.get('sse').objects.get('secret.txt').versions[0].data;
+  assert.ok(Buffer.isBuffer(raw));
+  assert.notEqual(raw.toString('utf8'), content);
+});
+
+test('sse: copy propagates encryption, non-encrypted stays plain', async () => {
+  await client.createBucket('sse-copy');
+  await client.putObject('sse-copy', 'src.txt', 'copy me', {
+    'x-amz-server-side-encryption': 'AES256',
+  });
+
+  // no explicit header => source encryption is preserved
+  const copy = await client.request('PUT', '/sse-copy/dst.txt', {
+    headers: { 'x-amz-copy-source': '/sse-copy/src.txt' },
+  });
+  assert.ok(copy.ok, copy.text);
+  const got = await client.getObject('sse-copy', 'dst.txt');
+  assert.equal(got.text, 'copy me');
+  assert.equal(got.headers.get('x-amz-server-side-encryption'), 'AES256');
+
+  // plain object has no sse header
+  await client.putObject('sse-copy', 'plain.txt', 'plain');
+  const plain = await client.getObject('sse-copy', 'plain.txt');
+  assert.equal(plain.headers.get('x-amz-server-side-encryption'), null);
+});
+
+test('sse: multipart upload with AES256', async () => {
+  await client.createBucket('sse-mp');
+  const init = await client.request('POST', '/sse-mp/big.bin', {
+    query: { uploads: '' },
+    headers: { 'x-amz-server-side-encryption': 'AES256' },
+  });
+  assert.ok(init.ok, init.text);
+  const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(init.text)[1];
+
+  const p1 = await client.request('PUT', '/sse-mp/big.bin', { query: { uploadId, partNumber: '1' }, body: 'AAA' });
+  const etag1 = p1.headers.get('etag').replace(/"/g, '');
+  const p2 = await client.request('PUT', '/sse-mp/big.bin', { query: { uploadId, partNumber: '2' }, body: 'BBB' });
+  const etag2 = p2.headers.get('etag').replace(/"/g, '');
+
+  const completeBody = `<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Part><PartNumber>1</PartNumber><ETag>"${etag1}"</ETag></Part>
+  <Part><PartNumber>2</PartNumber><ETag>"${etag2}"</ETag></Part>
+</CompleteMultipartUpload>`;
+  const complete = await client.request('POST', '/sse-mp/big.bin', {
+    query: { uploadId },
+    headers: { 'Content-Type': 'application/xml' },
+    body: completeBody,
+  });
+  assert.ok(complete.ok, complete.text);
+
+  const got = await client.getObject('sse-mp', 'big.bin');
+  assert.equal(got.text, 'AAABBB');
+  assert.equal(got.headers.get('x-amz-server-side-encryption'), 'AES256');
+});
+
+// ---- bucket policy ----
+test('policy: put / get / delete and enforce deny', async () => {
+  await client.createBucket('pol');
+  await client.putObject('pol', 'secret.txt', 's3cr3t');
+
+  // no policy yet => 404
+  const none = await client.getBucketPolicy('pol');
+  assert.equal(none.status, 404);
+
+  const denyGet = {
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Effect: 'Deny',
+        Principal: { AWS: '*' },
+        Action: 's3:GetObject',
+        Resource: 'arn:aws:s3:::pol/*',
+      },
+    ],
+  };
+  const put = await client.putBucketPolicy('pol', denyGet);
+  assert.equal(put.status, 204);
+
+  const got = await client.getBucketPolicy('pol');
+  assert.equal(got.status, 200);
+  assert.ok(JSON.parse(got.text).Statement[0].Effect === 'Deny');
+
+  // GetObject denied by policy
+  const denied = await client.getObject('pol', 'secret.txt');
+  assert.equal(denied.status, 403);
+  assert.ok(denied.text.includes('AccessDenied'));
+
+  // PutObject (not denied) still works
+  const putObj = await client.putObject('pol', 'other.txt', 'fine');
+  assert.ok(putObj.ok, putObj.text);
+
+  const del = await client.deleteBucketPolicy('pol');
+  assert.equal(del.status, 204);
+
+  const allowed = await client.getObject('pol', 'secret.txt');
+  assert.equal(allowed.status, 200);
+  assert.equal(allowed.text, 's3cr3t');
+});
+
+test('policy: malformed JSON is rejected', async () => {
+  await client.createBucket('pol-bad');
+  const res = await client.request('PUT', '/pol-bad', {
+    query: { policy: '' },
+    headers: { 'Content-Type': 'application/json' },
+    body: '{not json',
+  });
+  assert.equal(res.status, 400);
+  assert.ok(res.text.includes('MalformedPolicy'));
+});
+
+// ---- lifecycle ----
+test('lifecycle: put / get / delete + object expiration', async () => {
+  await client.createBucket('lc-exp');
+  await client.putObject('lc-exp', 'logs/a.txt', 'a');
+  await client.putObject('lc-exp', 'logs/b.txt', 'b');
+  await client.putObject('lc-exp', 'data/c.txt', 'c');
+
+  const rules = [
+    { id: 'expire-logs', prefix: 'logs/', status: 'Enabled', expiration: { days: 0 } },
+  ];
+  const put = await client.putBucketLifecycle('lc-exp', rules);
+  assert.ok(put.ok, put.text);
+
+  const get = await client.getBucketLifecycle('lc-exp');
+  assert.equal(get.status, 200);
+  assert.ok(get.text.includes('<ID>expire-logs</ID>'));
+  assert.ok(get.text.includes('<Prefix>logs/</Prefix>'));
+  assert.ok(get.text.includes('<Expiration><Days>0</Days></Expiration>'));
+
+  // trigger lifecycle processing
+  const trig = await client.request('POST', '/__lifecycle', { query: { bucket: 'lc-exp' } });
+  assert.ok(trig.ok, trig.text);
+  const json = JSON.parse(trig.text);
+  assert.equal(json.buckets, 1);
+  assert.equal(json.removed, 2);
+
+  const gone = await client.headObject('lc-exp', 'logs/a.txt');
+  assert.equal(gone.status, 404);
+  const kept = await client.headObject('lc-exp', 'data/c.txt');
+  assert.equal(kept.status, 200);
+
+  const del = await client.deleteBucketLifecycle('lc-exp');
+  assert.equal(del.status, 204);
+  const empty = await client.getBucketLifecycle('lc-exp');
+  assert.equal(empty.status, 404);
+});
+
+test('lifecycle: abort incomplete multipart uploads', async () => {
+  await client.createBucket('lc-mp');
+  const init = await client.request('POST', '/lc-mp/upload.bin', { query: { uploads: '' } });
+  const uploadId = /<UploadId>([^<]+)<\/UploadId>/.exec(init.text)[1];
+  await client.request('PUT', '/lc-mp/upload.bin', { query: { uploadId, partNumber: '1' }, body: 'Q' });
+
+  const rules = [{ id: 'abort-all', status: 'Enabled', abort: { days: 0 } }];
+  const put = await client.putBucketLifecycle('lc-mp', rules);
+  assert.ok(put.ok, put.text);
+
+  const trig = await client.request('POST', '/__lifecycle', { query: { bucket: 'lc-mp' } });
+  assert.ok(trig.ok, trig.text);
+  assert.equal(JSON.parse(trig.text).removed, 1);
+
+  const uploads = await client.request('GET', '/lc-mp', { query: { uploads: '' } });
+  assert.ok(!uploads.text.includes(uploadId));
 });

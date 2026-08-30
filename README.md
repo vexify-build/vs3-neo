@@ -18,6 +18,20 @@ authentication and a user-defined function (UDF) system.
   ad-hoc over an internal endpoint.
 - **Versioning** — per-bucket enable/disable, versioned writes, reads of a
   specific `versionId`, delete markers and version listing.
+- **Object tagging** — S3-compatible `Tagging` on buckets and objects
+  (`Get/Put/DeleteBucketTagging`, `Get/Put/DeleteObjectTagging`); object tags
+  are stored per-version.
+- **Server-side encryption (SSE-S3)** — `AES256` via the
+  `x-amz-server-side-encryption` header; objects are encrypted at rest with
+  AES-256-GCM using a configurable master key, transparently decrypted on
+  read and propagated on copy/multipart.
+- **Bucket policies** — IAM-style JSON policies
+  (`Get/Put/DeleteBucketPolicy`) evaluated against every request, with
+  `Principal`, `Action` and `Resource` matching (incl. wildcards).
+- **Lifecycle management** — S3-compatible `LifecycleConfiguration` with
+  `Expiration` (object age-based deletion, honors versioning) and
+  `AbortIncompleteMultipartUpload` cleanup, run on demand via
+  `POST /__lifecycle`.
 - **Metrics & health** — Prometheus-style `/__metrics`, plus `/__health` and
   `/__info` introspection endpoints.
 
@@ -64,6 +78,7 @@ Configuration is read from (in order of precedence):
 | `VS3_AUTH_ANONYMOUS`         | `false`             | allow unsigned requests              |
 | `VS3_AUTH_ACCESS_KEY`        | `minioadmin`        | access key (sets a single user)      |
 | `VS3_AUTH_SECRET_KEY`        | `minioadmin`        | secret key                           |
+| `VS3_ENCRYPTION_KEY`         | *(random)*          | 32-byte base64 master key for SSE-S3 |
 
 Config file example (`config/vs3-neo.json`):
 
@@ -75,6 +90,7 @@ Config file example (`config/vs3-neo.json`):
     "anonymous": false,
     "users": [{ "accessKey": "minioadmin", "secretKey": "minioadmin" }]
   },
+  "encryption": { "key": "base64-32-bytes" },
   "versioning": { "default": false },
   "functions": {
     "enabled": true,
@@ -92,6 +108,7 @@ Config file example (`config/vs3-neo.json`):
 | `GET /__info`             | service info (backend, functions, region)    |
 | `GET /__metrics`          | Prometheus-style metrics                     |
 | `POST /__presign`         | mint a presigned URL (authenticated)         |
+| `POST /__lifecycle`       | run lifecycle rules now (see below)          |
 | `POST /__function/:name`  | invoke a user-defined function ad-hoc        |
 | `GET /__functions`        | list registered functions                    |
 
@@ -112,7 +129,12 @@ Backends implement a small interface (see `src/storage/storage.js`):
 `copyObject`, versioning (`setVersioning`/`getVersioning`/`listVersions`)
 and multipart (`createMultipartUpload`, `uploadPart`, `listParts`,
 `completeMultipartUpload`, `abortMultipartUpload`,
-`listMultipartUploads`).
+`listMultipartUploads`), plus the extension points: tagging
+(`get/set/deleteObjectTagging`, `get/set/deleteBucketTagging`), bucket
+policy (`get/set/deleteBucketPolicy`) and lifecycle
+(`get/set/deleteLifecycle`, `runLifecycle`). Unimplemented extension
+methods throw `NotImplemented`, so custom backends can opt in
+incrementally.
 
 - **disk** (`src/storage/disk.js`) — default. Objects are written to disk
   with atomic tmp-file+rename, MD5 ETags, per-object version metadata and
@@ -153,6 +175,66 @@ Example — deny deletions:
 
 ```json
 { "functions": { "hooks": { "onDelete": "deny" } } }
+```
+
+## Tagging, SSE, policies & lifecycle
+
+### Object / bucket tagging
+
+Use the S3-compatible `?tagging` endpoints. The bundled client exposes
+`getBucketTagging`, `putBucketTagging`, `getObjectTagging`,
+`putObjectTagging`, `deleteObjectTagging`:
+
+```sh
+curl -X PUT "http://localhost:9000/bucket/doc.txt?tagging" \
+  -H 'Content-Type: application/xml' \
+  -d '<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>'
+```
+
+### Server-side encryption (SSE-S3)
+
+Send `x-amz-server-side-encryption: AES256` on `PutObject` /
+`CreateMultipartUpload` / `CopyObject`. Data is encrypted at rest with
+AES-256-GCM; the ciphertext nonce + tag are stored in object metadata and
+decryption is transparent on `GetObject`/`HeadObject`. The `AES256`
+response header echoes the encryption state.
+
+The master key comes from `VS3_ENCRYPTION_KEY` (base64, 32 bytes) or
+`config.encryption.key`; a random ephemeral key is derived when unset.
+
+### Bucket policies
+
+`PutBucketPolicy` stores an IAM-style JSON policy; every subsequent request
+is checked with `evaluatePolicy` (see `src/auth/policy.js`) — an explicit
+`Deny` wins, otherwise the bucket's own statements may allow; anonymous
+requests require an explicit `Allow`.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Deny",
+      "Principal": { "AWS": "*" },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::secret-bucket/*"
+    }
+  ]
+}
+```
+
+### Lifecycle management
+
+`PutBucketLifecycle` accepts an S3 `LifecycleConfiguration` with
+`Expiration.Days` (delete objects older than N days, honoring versioning)
+and `AbortIncompleteMultipartUpload.DaysAfterInitiation`. Rules match by
+`Filter.Prefix` and `Status`.
+
+Expiration runs on demand:
+
+```sh
+curl -X POST "http://localhost:9000/__lifecycle?bucket=my-bucket" -H 'Authorization: ...'
+# omit ?bucket to run all buckets; returns { "buckets": n, "removed": n }
 ```
 
 ## Authentication

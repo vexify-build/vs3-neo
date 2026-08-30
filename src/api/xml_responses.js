@@ -210,6 +210,40 @@ export function copyObjectXml(etag, lastModified) {
   return xmlDoc('CopyObjectResult', inner);
 }
 
+// ---- Tagging ----
+
+export function taggingXml(tags) {
+  const inner = rawEl(
+    'TagSet',
+    (tags || [])
+      .map((t) => rawEl('Tag', el('Key', t.Key) + el('Value', t.Value)))
+      .join(''),
+  );
+  return xmlDoc('Tagging', inner);
+}
+
+// ---- Lifecycle ----
+
+export function lifecycleXml(rules) {
+  const inner = (rules || [])
+    .map((r) =>
+      rawEl(
+        'Rule',
+        (r.id ? el('ID', r.id) : '') +
+          (r.prefix ? rawEl('Filter', el('Prefix', r.prefix)) : '') +
+          el('Status', r.status || 'Enabled') +
+          (r.expiration && r.expiration.days !== undefined
+            ? rawEl('Expiration', el('Days', String(r.expiration.days)))
+            : '') +
+          (r.abort && r.abort.days !== undefined
+            ? rawEl('AbortIncompleteMultipartUpload', el('DaysAfterInitiation', String(r.abort.days)))
+            : ''),
+      ),
+    )
+    .join('');
+  return xmlDoc('LifecycleConfiguration', inner);
+}
+
 function quoteEtag(etag) {
   if (typeof etag === 'string' && etag.startsWith('"')) return etag;
   return `"${etag}"`;

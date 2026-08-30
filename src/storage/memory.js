@@ -28,6 +28,7 @@ import {
   errInvalidPart,
   errInvalidPartOrder,
 } from './storage.js';
+import { encryptBuffer, decryptBuffer, deriveKey, SSE_ALGORITHM } from '../util/sse.js';
 
 // In-memory backend. Ephemeral; useful for tests, demos and as a compact
 // reference implementation of the Storage interface.
@@ -36,9 +37,10 @@ export class MemoryStorage extends Storage {
     return 'memory';
   }
 
-  constructor() {
+  constructor(cfg = {}) {
     super();
     this.buckets = new Map(); // name -> bucket
+    this.masterKey = deriveKey(cfg.sseKey || '');
   }
 
   async createBucket(bucket) {
@@ -84,20 +86,31 @@ export class MemoryStorage extends Storage {
   async putObject(bucket, key, stream, size, opts = {}) {
     const b = this.buckets.get(bucket);
     if (!b) throw errNoSuchBucket();
-    const data = Buffer.from(await streamToBuffer(stream));
+    const plain = Buffer.from(await streamToBuffer(stream));
     const versionId = b.versioning === 'Enabled' ? randomHex(16) : 'null';
+    let data = plain;
+    let enc;
+    if (opts.sse === SSE_ALGORITHM) {
+      const r = encryptBuffer(plain, this.masterKey);
+      data = r.data;
+      enc = { algorithm: SSE_ALGORITHM, nonce: r.nonce, tag: r.tag };
+    }
     const info = {
       bucket,
       key,
       versionId,
-      size: data.length,
-      etag: md5hex(data),
+      size: plain.length,
+      etag: md5hex(plain),
       contentType: opts.contentType || '',
       userMeta: opts.userMeta || {},
       lastModified: new Date(),
       isDeleteMarker: false,
       storageClass: 'STANDARD',
     };
+    if (enc) {
+      info.enc = enc;
+      info.sse = SSE_ALGORITHM;
+    }
     let obj = b.objects.get(key);
     if (!obj) {
       obj = { versions: [] };
@@ -116,6 +129,9 @@ export class MemoryStorage extends Storage {
     const v = findVersion(obj, versionId);
     if (!v || v.info.isDeleteMarker) throw errNoSuchKey();
     let data = v.data;
+    if (v.info.enc) {
+      data = decryptBuffer(data, this.masterKey, v.info.enc.nonce, v.info.enc.tag);
+    }
     if (range) {
       const start = range.start;
       const end = range.end === undefined ? data.length - 1 : Math.min(range.end, data.length - 1);
@@ -287,6 +303,7 @@ export class MemoryStorage extends Storage {
       initiated: new Date(),
       parts: new Map(),
     });
+    if (opts.sse === SSE_ALGORITHM) b.uploads.get(uploadId).sse = SSE_ALGORITHM;
     return uploadId;
   }
 
@@ -326,6 +343,7 @@ export class MemoryStorage extends Storage {
       hash.update(rec.data);
       total += rec.data.length;
     }
+    const plain = Buffer.concat(chunks);
     const versionId = b.versioning === 'Enabled' ? randomHex(16) : 'null';
     const info = {
       bucket,
@@ -339,13 +357,20 @@ export class MemoryStorage extends Storage {
       isDeleteMarker: false,
       storageClass: 'STANDARD',
     };
+    let data = plain;
+    if (up.sse === SSE_ALGORITHM) {
+      const r = encryptBuffer(plain, this.masterKey);
+      data = r.data;
+      info.enc = { algorithm: SSE_ALGORITHM, nonce: r.nonce, tag: r.tag };
+      info.sse = SSE_ALGORITHM;
+    }
     let obj = b.objects.get(key);
     if (!obj) {
       obj = { versions: [] };
       b.objects.set(key, obj);
     }
-    if (b.versioning === 'Enabled') obj.versions.unshift({ info, data: Buffer.concat(chunks) });
-    else obj.versions = [{ info, data: Buffer.concat(chunks) }];
+    if (b.versioning === 'Enabled') obj.versions.unshift({ info, data });
+    else obj.versions = [{ info, data }];
     b.uploads.delete(uploadId);
     return info;
   }
@@ -375,12 +400,133 @@ export class MemoryStorage extends Storage {
       initiated: up.initiated,
     }));
   }
+
+  // ---- tagging ----
+  async getObjectTagging(bucket, key, versionId) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    const obj = b.objects.get(key);
+    if (!obj) throw errNoSuchKey();
+    const v = findVersion(obj, versionId);
+    if (!v || v.info.isDeleteMarker) throw errNoSuchKey();
+    return v.info.tags || [];
+  }
+
+  async setObjectTagging(bucket, key, tags, versionId) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    const obj = b.objects.get(key);
+    if (!obj) throw errNoSuchKey();
+    const v = findVersion(obj, versionId);
+    if (!v || v.info.isDeleteMarker) throw errNoSuchKey();
+    v.info.tags = Array.isArray(tags) ? tags : [];
+  }
+
+  async deleteObjectTagging(bucket, key, versionId) {
+    await this.setObjectTagging(bucket, key, [], versionId);
+  }
+
+  async getBucketTagging(bucket) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    return b.tags || [];
+  }
+
+  async setBucketTagging(bucket, tags) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    b.tags = Array.isArray(tags) ? tags : [];
+  }
+
+  async deleteBucketTagging(bucket) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    delete b.tags;
+  }
+
+  // ---- policy ----
+  async getBucketPolicy(bucket) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    return b.policy || null;
+  }
+
+  async setBucketPolicy(bucket, policy) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    b.policy = String(policy);
+  }
+
+  async deleteBucketPolicy(bucket) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    delete b.policy;
+  }
+
+  // ---- lifecycle ----
+  async getLifecycle(bucket) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    return b.lifecycle || [];
+  }
+
+  async setLifecycle(bucket, rules) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    b.lifecycle = Array.isArray(rules) ? rules : [];
+  }
+
+  async deleteLifecycle(bucket) {
+    const b = this.buckets.get(bucket);
+    if (!b) throw errNoSuchBucket();
+    delete b.lifecycle;
+  }
+
+  async runLifecycle(bucket) {
+    const b = this.buckets.get(bucket);
+    if (!b) return 0;
+    const rules = (b.lifecycle || []).filter((r) => r && (r.status || 'Enabled') === 'Enabled');
+    if (rules.length === 0) return 0;
+    const now = Date.now();
+    let removed = 0;
+    for (const [key, obj] of b.objects) {
+      const v = findVersion(obj, '');
+      if (!v || v.info.isDeleteMarker) continue;
+      const ageDays = (now - v.info.lastModified.getTime()) / 86400000;
+      for (const rule of rules) {
+        if (!lifecycleMatches(rule, key)) continue;
+        if (rule.expiration && rule.expiration.days !== undefined && ageDays >= rule.expiration.days) {
+          await this.deleteObject(bucket, key, b.versioning === 'Enabled' ? v.info.versionId : '');
+          removed++;
+          break;
+        }
+      }
+    }
+    for (const rule of rules) {
+      if (!rule.abort || rule.abort.days === undefined) continue;
+      const cutoff = now - rule.abort.days * 86400000;
+      for (const [id, up] of b.uploads) {
+        if (!lifecycleMatches(rule, up.key)) continue;
+        if (up.initiated.getTime() < cutoff) {
+          await this.abortMultipartUpload(bucket, up.key, id);
+          removed++;
+        }
+      }
+    }
+    return removed;
+  }
 }
 
 function findVersion(obj, versionId) {
   if (!obj || obj.versions.length === 0) return null;
   if (!versionId) return obj.versions[0];
   return obj.versions.find((v) => v.info.versionId === versionId) || null;
+}
+
+// True if the lifecycle rule's prefix (when set) matches the key.
+function lifecycleMatches(rule, key) {
+  if (!rule.prefix) return true;
+  return key.startsWith(rule.prefix);
 }
 
 function makeMarker(bucket, key) {
